@@ -17,13 +17,15 @@ let package = Package(
     )
   ],
   dependencies: [
-    .package(name: "Models", path: "../Models")
+    .package(name: "Models", path: "../Models"),
+    .package(url: "https://github.com/Alamofire/Alamofire.git", from: "5.8.0")
   ],
   targets: [
     .target(
       name: "Network",
       dependencies: [
-        .product(name: "Models", package: "Models")
+        .product(name: "Models", package: "Models"),
+        .product(name: "Alamofire", package: "Alamofire")
       ],
       swiftSettings: [
         .swiftLanguageMode(.v6)
