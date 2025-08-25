@@ -1,3 +1,4 @@
+import Alamofire
 import Foundation
 import Models
 
@@ -37,23 +38,44 @@ public struct DeepLClient: Sendable {
   }
 
   public func request(target: String, text: String) async throws -> Translation {
-    var components = URLComponents(string: endpoint)!
-    var queryItems: [URLQueryItem] = []
-    queryItems.append(.init(name: "text", value: text))
-    queryItems.append(.init(name: "target_lang", value: target.uppercased()))
-    components.queryItems = queryItems
-    var request = URLRequest(url: components.url!)
-    request.httpMethod = "POST"
-    request.setValue(authorizationHeaderValue, forHTTPHeaderField: "Authorization")
-    request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-    let (result, _) = try await URLSession.shared.data(for: request)
-    let response = try decoder.decode(Response.self, from: result)
-    if let translation = response.translations.first {
-      return .init(
-        content: translation.text.removingPercentEncoding ?? "",
-        detectedSourceLanguage: translation.detectedSourceLanguage,
-        provider: "DeepL.com")
+    let parameters: [String: String] = [
+      "text": text,
+      "target_lang": target.uppercased()
+    ]
+    
+    let headers: HTTPHeaders = [
+      "Authorization": authorizationHeaderValue,
+      "Content-Type": "application/x-www-form-urlencoded"
+    ]
+    
+    return try await withCheckedThrowingContinuation { continuation in
+      AF.request(
+        endpoint,
+        method: .post,
+        parameters: parameters,
+        encoder: URLEncodedFormParameterEncoder.default,
+        headers: headers
+      ).responseData { response in
+        switch response.result {
+        case .success(let data):
+          do {
+            let decodedResponse = try self.decoder.decode(Response.self, from: data)
+            if let translation = decodedResponse.translations.first {
+              let result = Translation(
+                content: translation.text.removingPercentEncoding ?? "",
+                detectedSourceLanguage: translation.detectedSourceLanguage,
+                provider: "DeepL.com")
+              continuation.resume(returning: result)
+            } else {
+              continuation.resume(throwing: DeepLError.notFound)
+            }
+          } catch {
+            continuation.resume(throwing: error)
+          }
+        case .failure(let error):
+          continuation.resume(throwing: error)
+        }
+      }
     }
-    throw DeepLError.notFound
   }
 }

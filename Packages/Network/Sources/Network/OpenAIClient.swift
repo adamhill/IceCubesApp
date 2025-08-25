@@ -1,7 +1,22 @@
+import Alamofire
 import Foundation
 
 protocol OpenAIRequest: Encodable {
   var model: String { get }
+}
+
+struct RawDataEncoding: ParameterEncoding {
+  let data: Data
+  
+  init(data: Data) {
+    self.data = data
+  }
+  
+  func encode(_ urlRequest: URLRequestConvertible, with parameters: Parameters?) throws -> URLRequest {
+    var request = try urlRequest.asURLRequest()
+    request.httpBody = data
+    return request
+  }
 }
 
 public struct OpenAIClient {
@@ -126,17 +141,32 @@ public struct OpenAIClient {
   public init() {}
 
   public func request(_ prompt: Prompt) async throws -> Response {
-    do {
-      let jsonData = try encoder.encode(prompt.request)
-      var request = URLRequest(url: endpoint)
-      request.httpMethod = "POST"
-      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-      request.httpBody = jsonData
-      let (result, _) = try await URLSession.shared.data(for: request)
-      let response = try decoder.decode(Response.self, from: result)
-      return response
-    } catch {
-      throw error
+    let jsonData = try encoder.encode(prompt.request)
+    
+    let headers: HTTPHeaders = [
+      "Content-Type": "application/json"
+    ]
+    
+    return try await withCheckedThrowingContinuation { continuation in
+      AF.request(
+        endpoint,
+        method: .post,
+        parameters: nil,
+        encoding: RawDataEncoding(data: jsonData),
+        headers: headers
+      ).responseData { response in
+        switch response.result {
+        case .success(let data):
+          do {
+            let decodedResponse = try self.decoder.decode(Response.self, from: data)
+            continuation.resume(returning: decodedResponse)
+          } catch {
+            continuation.resume(throwing: error)
+          }
+        case .failure(let error):
+          continuation.resume(throwing: error)
+        }
+      }
     }
   }
 }

@@ -1,3 +1,4 @@
+import Alamofire
 import Foundation
 import Models
 
@@ -23,14 +24,22 @@ public struct SubClubClient: Sendable {
     guard let url = URL(string: url.appending(Endpoint.user(username: username).path)) else {
       return nil
     }
-    let request = URLRequest(url: url)
-    do {
-      let (result, _) = try await URLSession.shared.data(for: request)
-      let decoder = JSONDecoder()
-      let user = try decoder.decode(SubClubUser.self, from: result)
-      return user
-    } catch {
-      return nil
+    
+    return await withCheckedContinuation { continuation in
+      AF.request(url, method: .get).responseData { response in
+        switch response.result {
+        case .success(let data):
+          do {
+            let decoder = JSONDecoder()
+            let user = try decoder.decode(SubClubUser.self, from: data)
+            continuation.resume(returning: user)
+          } catch {
+            continuation.resume(returning: nil)
+          }
+        case .failure:
+          continuation.resume(returning: nil)
+        }
+      }
     }
   }
 }

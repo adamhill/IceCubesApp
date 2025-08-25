@@ -54,9 +54,9 @@ This document outlines the plan to refactor the IceCubesApp networking layer fro
 - [ ] Refactor InstanceSocialClient to use Alamofire
 
 ### Phase 4: WebSocket Handling
-- [ ] Keep URLSession.webSocketTask for WebSocket connections
-- [ ] Document why WebSockets remain with URLSession
-- [ ] Ensure WebSocket functionality is isolated and continues to work
+- [x] Keep URLSession.webSocketTask for WebSocket connections
+- [x] Document why WebSockets remain with URLSession
+- [x] Ensure WebSocket functionality is isolated and continues to work
 
 ### Phase 5: Testing and Validation
 - [ ] Update existing tests to work with Alamofire
