@@ -1,3 +1,4 @@
+import Alamofire
 import Combine
 import Foundation
 import Models
@@ -41,7 +42,7 @@ import os
 
   public let server: String
   public let version: Version
-  private let urlSession: URLSession
+  private let session: Session
   private let decoder = JSONDecoder()
 
   private let logger = Logger(subsystem: "com.icecubesapp", category: "networking")
@@ -69,7 +70,11 @@ import os
     self.server = server
     self.version = version
     critical = .init(initialState: Critical(oauthToken: oauthToken, connections: [server]))
-    urlSession = URLSession.shared
+    
+    // Create Alamofire session with custom configuration
+    let configuration = URLSessionConfiguration.default
+    session = Session(configuration: configuration)
+    
     decoder.keyDecodingStrategy = .convertFromSnakeCase
   }
 
@@ -113,112 +118,256 @@ import os
     return url
   }
 
-  private func makeURLRequest(url: URL, endpoint: Endpoint, httpMethod: String) -> URLRequest {
-    var request = URLRequest(url: url)
-    request.httpMethod = httpMethod
+  private func makeHeaders(endpoint: Endpoint) -> HTTPHeaders {
+    var headers = HTTPHeaders()
+    
     if let oauthToken = critical.withLock({ $0.oauthToken }) {
-      request.setValue("Bearer \(oauthToken.accessToken)", forHTTPHeaderField: "Authorization")
+      headers.add(.authorization(bearerToken: oauthToken.accessToken))
     }
-    if let json = endpoint.jsonValue {
-      let encoder = JSONEncoder()
-      encoder.keyEncodingStrategy = .convertToSnakeCase
-      encoder.outputFormatting = .sortedKeys
-      do {
-        let jsonData = try encoder.encode(json)
-        request.httpBody = jsonData
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-      } catch {
-        logger.error("Error encoding JSON: \(error.localizedDescription)")
-      }
+    
+    if endpoint.jsonValue != nil {
+      headers.add(.contentType("application/json"))
     }
-    return request
+    
+    return headers
   }
 
-  private func makeGet(endpoint: Endpoint) throws -> URLRequest {
-    let url = try makeURL(endpoint: endpoint)
-    return makeURLRequest(url: url, endpoint: endpoint, httpMethod: "GET")
+  private func makeParameters(endpoint: Endpoint) throws -> Parameters? {
+    guard let json = endpoint.jsonValue else { return nil }
+    
+    let encoder = JSONEncoder()
+    encoder.keyEncodingStrategy = .convertToSnakeCase
+    encoder.outputFormatting = .sortedKeys
+    
+    let jsonData = try encoder.encode(json)
+    guard let dictionary = try JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
+      return nil
+    }
+    
+    return dictionary
+  }
+
+  private func makeEntityRequest<Entity: Decodable>(
+    endpoint: Endpoint,
+    method: HTTPMethod,
+    forceVersion: Version? = nil
+  ) async throws -> Entity {
+    let url = try makeURL(endpoint: endpoint, forceVersion: forceVersion)
+    let headers = makeHeaders(endpoint: endpoint)
+    let parameters = try makeParameters(endpoint: endpoint)
+    
+    return try await withCheckedThrowingContinuation { continuation in
+      let request = session.request(
+        url,
+        method: method,
+        parameters: parameters,
+        encoding: JSONEncoding.default,
+        headers: headers
+      )
+      
+      logger.log(level: .info, "\(request)")
+      
+      request.responseData { response in
+        switch response.result {
+        case .success(let data):
+          self.logResponseOnError(httpResponse: response.response, data: data)
+          do {
+            let entity = try self.decoder.decode(Entity.self, from: data)
+            continuation.resume(returning: entity)
+          } catch {
+            if var serverError = try? self.decoder.decode(ServerError.self, from: data) {
+              if let httpResponse = response.response {
+                serverError.httpCode = httpResponse.statusCode
+              }
+              continuation.resume(throwing: serverError)
+            } else {
+              continuation.resume(throwing: error)
+            }
+          }
+        case .failure(let error):
+          continuation.resume(throwing: error)
+        }
+      }
+    }
   }
 
   public func get<Entity: Decodable>(endpoint: Endpoint, forceVersion: Version? = nil) async throws
     -> Entity
   {
-    try await makeEntityRequest(endpoint: endpoint, method: "GET", forceVersion: forceVersion)
+    try await makeEntityRequest(endpoint: endpoint, method: .get, forceVersion: forceVersion)
   }
 
   public func getWithLink<Entity: Decodable>(endpoint: Endpoint) async throws -> (
     Entity, LinkHandler?
   ) {
-    let request = try makeGet(endpoint: endpoint)
-    let (data, httpResponse) = try await urlSession.data(for: request)
-    var linkHandler: LinkHandler?
-    if let response = httpResponse as? HTTPURLResponse,
-      let link = response.allHeaderFields["Link"] as? String
-    {
-      linkHandler = .init(rawLink: link)
+    let url = try makeURL(endpoint: endpoint)
+    let headers = makeHeaders(endpoint: endpoint)
+    
+    return try await withCheckedThrowingContinuation { continuation in
+      let request = session.request(url, method: .get, headers: headers)
+      
+      request.responseData { response in
+        var linkHandler: LinkHandler?
+        if let link = response.response?.allHeaderFields["Link"] as? String {
+          linkHandler = .init(rawLink: link)
+        }
+        
+        switch response.result {
+        case .success(let data):
+          self.logResponseOnError(httpResponse: response.response, data: data)
+          self.logger.log(level: .info, "\(request)")
+          do {
+            let entity = try self.decoder.decode(Entity.self, from: data)
+            continuation.resume(returning: (entity, linkHandler))
+          } catch {
+            continuation.resume(throwing: error)
+          }
+        case .failure(let error):
+          continuation.resume(throwing: error)
+        }
+      }
     }
-    logResponseOnError(httpResponse: httpResponse, data: data)
-    logger.log(level: .info, "\(request)")
-    return try (decoder.decode(Entity.self, from: data), linkHandler)
   }
 
   public func post<Entity: Decodable>(endpoint: Endpoint, forceVersion: Version? = nil) async throws
     -> Entity
   {
-    try await makeEntityRequest(endpoint: endpoint, method: "POST", forceVersion: forceVersion)
+    try await makeEntityRequest(endpoint: endpoint, method: .post, forceVersion: forceVersion)
   }
 
   public func post(endpoint: Endpoint, forceVersion: Version? = nil) async throws
     -> HTTPURLResponse?
   {
     let url = try makeURL(endpoint: endpoint, forceVersion: forceVersion)
-    let request = makeURLRequest(url: url, endpoint: endpoint, httpMethod: "POST")
-    let (_, httpResponse) = try await urlSession.data(for: request)
-    return httpResponse as? HTTPURLResponse
+    let headers = makeHeaders(endpoint: endpoint)
+    let parameters = try makeParameters(endpoint: endpoint)
+    
+    return try await withCheckedThrowingContinuation { continuation in
+      let request = session.request(
+        url,
+        method: .post,
+        parameters: parameters,
+        encoding: JSONEncoding.default,
+        headers: headers
+      )
+      
+      request.response { response in
+        switch response.result {
+        case .success:
+          continuation.resume(returning: response.response)
+        case .failure(let error):
+          continuation.resume(throwing: error)
+        }
+      }
+    }
   }
 
   public func patch(endpoint: Endpoint) async throws -> HTTPURLResponse? {
     let url = try makeURL(endpoint: endpoint)
-    let request = makeURLRequest(url: url, endpoint: endpoint, httpMethod: "PATCH")
-    let (_, httpResponse) = try await urlSession.data(for: request)
-    return httpResponse as? HTTPURLResponse
+    let headers = makeHeaders(endpoint: endpoint)
+    let parameters = try makeParameters(endpoint: endpoint)
+    
+    return try await withCheckedThrowingContinuation { continuation in
+      let request = session.request(
+        url,
+        method: .patch,
+        parameters: parameters,
+        encoding: JSONEncoding.default,
+        headers: headers
+      )
+      
+      request.response { response in
+        switch response.result {
+        case .success:
+          continuation.resume(returning: response.response)
+        case .failure(let error):
+          continuation.resume(throwing: error)
+        }
+      }
+    }
   }
 
   public func put<Entity: Decodable>(endpoint: Endpoint, forceVersion: Version? = nil) async throws
     -> Entity
   {
-    try await makeEntityRequest(endpoint: endpoint, method: "PUT", forceVersion: forceVersion)
+    try await makeEntityRequest(endpoint: endpoint, method: .put, forceVersion: forceVersion)
   }
 
   public func delete(endpoint: Endpoint, forceVersion: Version? = nil) async throws
     -> HTTPURLResponse?
   {
     let url = try makeURL(endpoint: endpoint, forceVersion: forceVersion)
-    let request = makeURLRequest(url: url, endpoint: endpoint, httpMethod: "DELETE")
-    let (_, httpResponse) = try await urlSession.data(for: request)
-    return httpResponse as? HTTPURLResponse
+    let headers = makeHeaders(endpoint: endpoint)
+    
+    return try await withCheckedThrowingContinuation { continuation in
+      let request = session.request(url, method: .delete, headers: headers)
+      
+      request.response { response in
+        switch response.result {
+        case .success:
+          continuation.resume(returning: response.response)
+        case .failure(let error):
+          continuation.resume(throwing: error)
+        }
+      }
+    }
   }
 
   private func makeEntityRequest<Entity: Decodable>(
     endpoint: Endpoint,
-    method: String,
+    method: HTTPMethod,
     forceVersion: Version? = nil
   ) async throws -> Entity {
     let url = try makeURL(endpoint: endpoint, forceVersion: forceVersion)
-    let request = makeURLRequest(url: url, endpoint: endpoint, httpMethod: method)
-    let (data, httpResponse) = try await urlSession.data(for: request)
-    logger.log(level: .info, "\(request)")
-    logResponseOnError(httpResponse: httpResponse, data: data)
-    do {
-      return try decoder.decode(Entity.self, from: data)
-    } catch {
-      if var serverError = try? decoder.decode(ServerError.self, from: data) {
-        if let httpResponse = httpResponse as? HTTPURLResponse {
-          serverError.httpCode = httpResponse.statusCode
+    let headers = makeHeaders(endpoint: endpoint)
+    let parameters = try makeParameters(endpoint: endpoint)
+    
+    return try await withCheckedThrowingContinuation { continuation in
+      let request = session.request(
+        url,
+        method: method,
+        parameters: parameters,
+        encoding: JSONEncoding.default,
+        headers: headers
+      )
+      
+      logger.log(level: .info, "\(request)")
+      
+      request.responseData { response in
+        switch response.result {
+        case .success(let data):
+          self.logResponseOnError(httpResponse: response.response, data: data)
+          do {
+            let entity = try self.decoder.decode(Entity.self, from: data)
+            continuation.resume(returning: entity)
+          } catch {
+            if var serverError = try? self.decoder.decode(ServerError.self, from: data) {
+              if let httpResponse = response.response {
+                serverError.httpCode = httpResponse.statusCode
+              }
+              continuation.resume(throwing: serverError)
+            } else {
+              continuation.resume(throwing: error)
+            }
+          }
+        case .failure(let error):
+          continuation.resume(throwing: error)
         }
-        throw serverError
       }
-      throw error
     }
+  }
+
+  public func makeWebSocketTask(endpoint: Endpoint, instanceStreamingURL: URL?) throws
+    -> URLSessionWebSocketTask
+  {
+    // WebSocket support: Alamofire doesn't support WebSockets, so we continue using URLSession
+    let url = try makeURL(
+      scheme: "wss", endpoint: endpoint, forceServer: instanceStreamingURL?.host)
+    var subprotocols: [String] = []
+    if let oauthToken = critical.withLock({ $0.oauthToken }) {
+      subprotocols.append(oauthToken.accessToken)
+    }
+    return URLSession.shared.webSocketTask(with: url, protocols: subprotocols)
   }
 
   public func oauthURL() async throws -> URL {
@@ -245,18 +394,6 @@ import os
     return token
   }
 
-  public func makeWebSocketTask(endpoint: Endpoint, instanceStreamingURL: URL?) throws
-    -> URLSessionWebSocketTask
-  {
-    let url = try makeURL(
-      scheme: "wss", endpoint: endpoint, forceServer: instanceStreamingURL?.host)
-    var subprotocols: [String] = []
-    if let oauthToken = critical.withLock({ $0.oauthToken }) {
-      subprotocols.append(oauthToken.accessToken)
-    }
-    return urlSession.webSocketTask(with: url, protocols: subprotocols)
-  }
-
   public func mediaUpload<Entity: Decodable>(
     endpoint: Endpoint,
     version: Version,
@@ -265,22 +402,37 @@ import os
     filename: String,
     data: Data
   ) async throws -> Entity {
-    let request = try makeFormDataRequest(
-      endpoint: endpoint,
-      version: version,
-      method: method,
-      mimeType: mimeType,
-      filename: filename,
-      data: data)
-    let (data, httpResponse) = try await urlSession.data(for: request)
-    logResponseOnError(httpResponse: httpResponse, data: data)
-    do {
-      return try decoder.decode(Entity.self, from: data)
-    } catch {
-      if let serverError = try? decoder.decode(ServerError.self, from: data) {
-        throw serverError
+    let url = try makeURL(endpoint: endpoint, forceVersion: version)
+    let headers = makeHeaders(endpoint: endpoint)
+    
+    return try await withCheckedThrowingContinuation { continuation in
+      let request = session.upload(
+        multipartFormData: { multipartFormData in
+          multipartFormData.append(data, withName: filename, fileName: filename, mimeType: mimeType)
+        },
+        to: url,
+        method: HTTPMethod(rawValue: method) ?? .post,
+        headers: headers
+      )
+      
+      request.responseData { response in
+        switch response.result {
+        case .success(let responseData):
+          self.logResponseOnError(httpResponse: response.response, data: responseData)
+          do {
+            let entity = try self.decoder.decode(Entity.self, from: responseData)
+            continuation.resume(returning: entity)
+          } catch {
+            if let serverError = try? self.decoder.decode(ServerError.self, from: responseData) {
+              continuation.resume(throwing: serverError)
+            } else {
+              continuation.resume(throwing: error)
+            }
+          }
+        case .failure(let error):
+          continuation.resume(throwing: error)
+        }
       }
-      throw error
     }
   }
 
@@ -292,44 +444,31 @@ import os
     filename: String,
     data: Data
   ) async throws -> HTTPURLResponse? {
-    let request = try makeFormDataRequest(
-      endpoint: endpoint,
-      version: version,
-      method: method,
-      mimeType: mimeType,
-      filename: filename,
-      data: data)
-    let (_, httpResponse) = try await urlSession.data(for: request)
-    return httpResponse as? HTTPURLResponse
-  }
-
-  private func makeFormDataRequest(
-    endpoint: Endpoint,
-    version: Version,
-    method: String,
-    mimeType: String,
-    filename: String,
-    data: Data
-  ) throws -> URLRequest {
     let url = try makeURL(endpoint: endpoint, forceVersion: version)
-    var request = makeURLRequest(url: url, endpoint: endpoint, httpMethod: method)
-    let boundary = UUID().uuidString
-    request.setValue(
-      "multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-    let httpBody = NSMutableData()
-    httpBody.append("--\(boundary)\r\n".data(using: .utf8)!)
-    httpBody.append(
-      "Content-Disposition: form-data; name=\"\(filename)\"; filename=\"\(filename)\"\r\n".data(
-        using: .utf8)!)
-    httpBody.append("Content-Type: \(mimeType)\r\n".data(using: .utf8)!)
-    httpBody.append("\r\n".data(using: .utf8)!)
-    httpBody.append(data)
-    httpBody.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
-    request.httpBody = httpBody as Data
-    return request
+    let headers = makeHeaders(endpoint: endpoint)
+    
+    return try await withCheckedThrowingContinuation { continuation in
+      let request = session.upload(
+        multipartFormData: { multipartFormData in
+          multipartFormData.append(data, withName: filename, fileName: filename, mimeType: mimeType)
+        },
+        to: url,
+        method: HTTPMethod(rawValue: method) ?? .post,
+        headers: headers
+      )
+      
+      request.response { response in
+        switch response.result {
+        case .success:
+          continuation.resume(returning: response.response)
+        case .failure(let error):
+          continuation.resume(throwing: error)
+        }
+      }
+    }
   }
 
-  private func logResponseOnError(httpResponse: URLResponse, data: Data) {
+  private func logResponseOnError(httpResponse: URLResponse?, data: Data) {
     if let httpResponse = httpResponse as? HTTPURLResponse, httpResponse.statusCode > 299 {
       let error =
         "HTTP Response error: \(httpResponse.statusCode), response: \(httpResponse), data: \(String(data: data, encoding: .utf8) ?? "")"

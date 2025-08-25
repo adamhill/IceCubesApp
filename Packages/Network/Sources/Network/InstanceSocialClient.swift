@@ -1,3 +1,4 @@
+import Alamofire
 import Foundation
 import Models
 
@@ -16,23 +17,32 @@ public struct InstanceSocialClient: Sendable {
 
   public func fetchInstances(keyword: String) async -> [InstanceSocial] {
     let keyword = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
-
     let endpoint = keyword.isEmpty ? listEndpoint : searchEndpoint + "?q=\(keyword)"
-
+    
     guard let url = URL(string: endpoint) else { return [] }
-
-    var request = URLRequest(url: url)
-    request.setValue(authorization, forHTTPHeaderField: "Authorization")
-
-    guard let (data, _) = try? await URLSession.shared.data(for: request) else { return [] }
-
-    let decoder = JSONDecoder()
-    decoder.keyDecodingStrategy = .convertFromSnakeCase
-
-    guard let response = try? decoder.decode(Response.self, from: data) else { return [] }
-
-    let result = response.instances.sorted(by: keyword)
-    return result
+    
+    let headers: HTTPHeaders = [
+      "Authorization": authorization
+    ]
+    
+    return await withCheckedContinuation { continuation in
+      AF.request(url, method: .get, headers: headers).responseData { response in
+        switch response.result {
+        case .success(let data):
+          do {
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            let decodedResponse = try decoder.decode(Response.self, from: data)
+            let result = decodedResponse.instances.sorted(by: keyword)
+            continuation.resume(returning: result)
+          } catch {
+            continuation.resume(returning: [])
+          }
+        case .failure:
+          continuation.resume(returning: [])
+        }
+      }
+    }
   }
 }
 
